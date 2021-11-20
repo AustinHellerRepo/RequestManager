@@ -103,11 +103,41 @@ class Message(ABC):
 
 	def send(self, *, kafka_manager: KafkaManager) -> AsyncHandle:
 
-		kafka_writer = kafka_manager.get_async_writer()
+		def get_result(read_only_async_handle: ReadOnlyAsyncHandle) -> Message:
+			nonlocal kafka_manager
 
-		async_handle = kafka_writer.write_message(
-			topic_name=self.get_location_uuid(),
-			message_bytes=self.to_bytes()
+			kafka_writer = kafka_manager.get_async_writer()
+
+			message_bytes_async_handle = kafka_writer.write_message(
+				topic_name=self.get_location_uuid(),
+				message_bytes=self.to_bytes()
+			)
+
+			message_bytes_async_handle.add_parent(
+				async_handle=read_only_async_handle
+			)
+
+			if not message_bytes_async_handle.try_wait(
+				timeout_seconds=5
+			):
+				raise Exception(f"Message: send: message_bytes_async_handle")
+
+			message_bytes = message_bytes_async_handle.get_result()
+
+			message = None
+
+			if not read_only_async_handle.is_cancelled():
+				message = Message.get_message_from_bytes(
+					message_bytes=message_bytes
+				)
+
+			return message
+
+		async_handle = AsyncHandle(
+			get_result_method=get_result
+		)
+		async_handle.try_wait(
+			timeout_seconds=0
 		)
 
 		return async_handle
@@ -209,9 +239,11 @@ class RequestManager():
 
 	def submit_request(self, *, destination_uuid: str, json_data_array: List[Dict]) -> AsyncHandle:
 
-		def get_result(read_only_async_handle: ReadOnlyAsyncHandle):
+		def get_result(read_only_async_handle: ReadOnlyAsyncHandle) -> RequestInstance:
 			nonlocal destination_uuid
 			nonlocal json_data_array
+
+			request_instance = None  # type: RequestInstance
 
 			request_message = Message(
 				message_type="request",
@@ -231,7 +263,7 @@ class RequestManager():
 				async_handle=read_only_async_handle
 			)
 
-			request_async_handle.get_result()
+			sent_request_message = request_async_handle.get_result()  # type: Message
 
 			if not read_only_async_handle.is_cancelled():
 				notification_message = Message(
@@ -252,7 +284,14 @@ class RequestManager():
 					async_handle=read_only_async_handle
 				)
 
-				notification_async_handle.get_result()
+				sent_notification_message = notification_async_handle.get_result()  # type: Message
+
+				request_instance = RequestInstance(
+					kafka_manager=self.__kafka_manager,
+					process_instance_uuid=self.__process_instance_uuid
+				)
+
+			return request_instance
 
 		async_handle = AsyncHandle(
 			get_result_method=get_result
@@ -430,7 +469,9 @@ class NotificationManager():
 				async_handle=read_only_async_handle
 			)
 
-			return request_message_async_handle.get_result()
+			found_request_message = request_message_async_handle.get_result()  # type: Message
+
+			return found_request_message
 
 		async_handle = AsyncHandle(
 			get_result_method=get_result
@@ -443,7 +484,7 @@ class NotificationManager():
 
 	def respond_to_request(self, *, request_message: Message, reservation_message: Message, json_data_array: List[Dict]) -> AsyncHandle:
 
-		def get_result(read_only_async_handle: ReadOnlyAsyncHandle):
+		def get_result(read_only_async_handle: ReadOnlyAsyncHandle) -> Message:
 			nonlocal request_message
 			nonlocal reservation_message
 			nonlocal json_data_array
@@ -466,7 +507,9 @@ class NotificationManager():
 				async_handle=read_only_async_handle
 			)
 
-			send_to_destination_async_handle.get_result()
+			sent_response_message = send_to_destination_async_handle.get_result()  # type: Message
+
+			return sent_response_message
 
 		async_handle = AsyncHandle(
 			get_result_method=get_result
