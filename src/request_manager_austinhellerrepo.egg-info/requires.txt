@@ -1,0 +1,2 @@
+kafka-manager-austinhellerrepo@ git+https://github.com/AustinHellerRepo/KafkaManager
+threading-austinhellerrepo@ git+https://github.com/AustinHellerRepo/Threading
