@@ -88,8 +88,8 @@ class Message(ABC):
 			is_pointer=message_json["pointer"],
 			process_instance_uuid=message_json["process"],
 			json_data_array=message_json["data"],
-			source_uuid=message_json["source_uuid"],
-			destination_uuid=message_json["destination_uuid"],
+			source_uuid=message_json["source"],
+			destination_uuid=message_json["destination"],
 			parent_message_uuid=message_json["parent_id"]
 		)
 
@@ -145,10 +145,11 @@ class Message(ABC):
 
 class TopicScanner():
 
-	def __init__(self, *, kafka_manager: KafkaManager, topic_name: str):
+	def __init__(self, *, kafka_manager: KafkaManager, topic_name: str, end_of_topic_read_timeout_seconds: float):
 
 		self.__kafka_manager = kafka_manager
 		self.__topic_name = topic_name
+		self.__end_of_topic_read_timeout_seconds = end_of_topic_read_timeout_seconds
 
 	def get_first_message_matching_criteria(self, *, is_match_method: Callable[[Message], bool]) -> AsyncHandle:
 
@@ -164,18 +165,26 @@ class TopicScanner():
 			)
 
 			found_message = None
-			while found_message is None and not read_only_async_handle.is_cancelled():
-				read_async_handle = kafka_reader.read_message()
+			is_last_message_read = False
+			while found_message is None and not is_last_message_read and not read_only_async_handle.is_cancelled():
+				read_async_handle = kafka_reader.try_read_message(
+					timeout_seconds=self.__end_of_topic_read_timeout_seconds
+				)
 				read_async_handle.add_parent(
 					async_handle=read_only_async_handle
 				)
 				message_bytes = read_async_handle.get_result()  # type: bytes
 				if not read_only_async_handle.is_cancelled():
-					message = Message.get_message_from_bytes(
-						message_bytes=message_bytes
-					)
-					if is_match_method(message):
-						found_message = message
+					if message_bytes is None:
+						is_last_message_read = True
+					else:
+						message = Message.get_message_from_bytes(
+							message_bytes=message_bytes
+						)
+						print(f"checking topic {self.__topic_name} message: {message.to_json()}")
+						if is_match_method(message):
+							found_message = message
+							print(f"found message")
 			return found_message
 
 		async_handle = AsyncHandle(
@@ -190,10 +199,19 @@ class TopicScanner():
 
 class RequestInstance():
 
-	def __init__(self, *, kafka_manager: KafkaManager, process_instance_uuid: str):
+	def __init__(self, *, kafka_manager: KafkaManager, process_instance_uuid: str, request_message: Message, notification_message: Message, end_of_topic_read_timeout_seconds: float):
 
 		self.__kafka_manager = kafka_manager
 		self.__process_instance_uuid = process_instance_uuid
+		self.__request_message = request_message
+		self.__notification_message = notification_message
+		self.__end_of_topic_read_timeout_seconds = end_of_topic_read_timeout_seconds
+
+	def get_request_message(self) -> Message:
+		return self.__request_message
+
+	def get_notification_message(self) -> Message:
+		return self.__notification_message
 
 	def get_response_json_data_array(self) -> AsyncHandle:
 
@@ -201,7 +219,8 @@ class RequestInstance():
 
 			topic_scanner = TopicScanner(
 				kafka_manager=self.__kafka_manager,
-				topic_name=self.__process_instance_uuid
+				topic_name=self.__process_instance_uuid,
+				end_of_topic_read_timeout_seconds=self.__end_of_topic_read_timeout_seconds
 			)
 
 			def is_response(message: Message):
@@ -231,9 +250,10 @@ class RequestInstance():
 
 class RequestManager():
 
-	def __init__(self, *, kafka_manager: KafkaManager):
+	def __init__(self, *, kafka_manager: KafkaManager, end_of_topic_read_timeout_seconds: float):
 
 		self.__kafka_manager = kafka_manager
+		self.__end_of_topic_read_timeout_seconds = end_of_topic_read_timeout_seconds
 
 		self.__process_instance_uuid = str(uuid.uuid4())
 
@@ -242,6 +262,16 @@ class RequestManager():
 		def get_result(read_only_async_handle: ReadOnlyAsyncHandle) -> RequestInstance:
 			nonlocal destination_uuid
 			nonlocal json_data_array
+
+			add_topic_async_handle = self.__kafka_manager.add_topic(
+				topic_name=self.__process_instance_uuid
+			)
+
+			add_topic_async_handle.add_parent(
+				async_handle=read_only_async_handle
+			)
+
+			add_topic_async_handle.get_result()
 
 			request_instance = None  # type: RequestInstance
 
@@ -288,7 +318,10 @@ class RequestManager():
 
 				request_instance = RequestInstance(
 					kafka_manager=self.__kafka_manager,
-					process_instance_uuid=self.__process_instance_uuid
+					process_instance_uuid=self.__process_instance_uuid,
+					request_message=sent_request_message,
+					notification_message=sent_notification_message,
+					end_of_topic_read_timeout_seconds=self.__end_of_topic_read_timeout_seconds
 				)
 
 			return request_instance
@@ -305,9 +338,10 @@ class RequestManager():
 
 class NotificationManager():
 
-	def __init__(self, *, kafka_manager: KafkaManager):
+	def __init__(self, *, kafka_manager: KafkaManager, end_of_topic_read_timeout_seconds: float):
 
 		self.__kafka_manager = kafka_manager
+		self.__end_of_topic_read_timeout_seconds = end_of_topic_read_timeout_seconds
 
 		self.__process_instance_uuid = str(uuid.uuid4())
 
@@ -318,7 +352,8 @@ class NotificationManager():
 
 			topic_scanner = TopicScanner(
 				kafka_manager=self.__kafka_manager,
-				topic_name=topic_name
+				topic_name=topic_name,
+				end_of_topic_read_timeout_seconds=self.__end_of_topic_read_timeout_seconds
 			)
 
 			previous_notification_message_uuid = None  # type: str
@@ -334,10 +369,19 @@ class NotificationManager():
 					if not is_past_previous_notification_message_uuid:
 						if message.get_message_uuid() == previous_notification_message_uuid:
 							is_past_previous_notification_message_uuid = True
+						print(f"failed to match: {message.to_json()}")
 						return False
 					else:
-						return message.get_message_type() == "notification"
+						print(f"failed to match: {message.to_json()}")
+						is_notification = message.get_message_type() == "notification"
+						if is_notification:
+							print(f"found notification")
+							return True
+						else:
+							print(f"failed to find notification")
+							return False
 
+				print(f"about to scan 00 {topic_name}")
 				notification_async_handle = topic_scanner.get_first_message_matching_criteria(
 					is_match_method=is_notification_match
 				)
@@ -347,6 +391,7 @@ class NotificationManager():
 				)
 
 				found_notification_message = notification_async_handle.get_result()  # type: Message
+				print(f"finished scan 00 {topic_name}")
 
 				if not read_only_async_handle.is_cancelled():
 					previous_notification_message_uuid = found_notification_message.get_message_uuid()
@@ -356,6 +401,7 @@ class NotificationManager():
 						return message.get_parent_message_uuid() == found_notification_message.get_message_uuid() and \
 							message.get_message_type() == "reservation"
 
+					print(f"about to scan 01 {topic_name}")
 					reservation_async_handle = topic_scanner.get_first_message_matching_criteria(
 						is_match_method=is_reservation_match
 					)
@@ -365,6 +411,7 @@ class NotificationManager():
 					)
 
 					found_reservation_message = reservation_async_handle.get_result()  # type: Message
+					print(f"finished scan 01 {topic_name}")
 
 					if not read_only_async_handle.is_cancelled():
 						if found_reservation_message is None:
@@ -418,7 +465,8 @@ class NotificationManager():
 
 				topic_scanner = TopicScanner(
 					kafka_manager=self.__kafka_manager,
-					topic_name=notification_message.get_destination_uuid()
+					topic_name=notification_message.get_destination_uuid(),
+					end_of_topic_read_timeout_seconds=self.__end_of_topic_read_timeout_seconds
 				)
 
 				verified_reservation_message_async_handle = topic_scanner.get_first_message_matching_criteria(
@@ -454,7 +502,8 @@ class NotificationManager():
 
 			topic_scanner = TopicScanner(
 				kafka_manager=self.__kafka_manager,
-				topic_name=notification_message.get_source_uuid()
+				topic_name=notification_message.get_source_uuid(),
+				end_of_topic_read_timeout_seconds=self.__end_of_topic_read_timeout_seconds
 			)
 
 			def is_request(message: Message) -> bool:
